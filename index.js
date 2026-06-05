@@ -7,6 +7,7 @@
 
 import 'dotenv/config'
 import { createServer } from 'http'
+import { URL } from 'url'
 import { WebSocketServer } from 'ws'
 import jwt from 'jsonwebtoken'
 
@@ -94,10 +95,32 @@ function authenticateClient(token, ip) {
 }
 
 /**
+ * Register a decoded JWT as an authenticated client
+ */
+function registerClient(client, ws, decoded, ip, source) {
+  const clientId = decoded.id || decoded.sub || 'unknown'
+  client.userId = clientId
+  client.tenantId = decoded.tenantId
+  client.mode = decoded.mode || 'tenant'
+  client.authenticated = true
+
+  clients.set(ws, client)
+  connectionsByIp.set(ip, (connectionsByIp.get(ip) || 0) + 1)
+  if (decoded.tenantId) {
+    connectionsByTenant.set(decoded.tenantId, (connectionsByTenant.get(decoded.tenantId) || 0) + 1)
+  }
+  console.log(`✅ Client authenticated (${source}): ${clientId} (${decoded.tenantId || 'account'} mode)`)
+}
+
+/**
  * Handle new WebSocket connection
  */
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress || 'unknown'
+
+  // Query token — lower priority, used only if no message-based auth arrives
+  const url = new URL(req.url, `http://${req.headers.host}`)
+  const queryToken = url.searchParams.get('token')
 
   const client = {
     ws,
@@ -110,6 +133,22 @@ wss.on('connection', (ws, req) => {
     authenticated: false
   }
 
+  // Schedule query token as fallback — fires after a short delay
+  // allowing the client to send an authenticate message first.
+  // If a message token arrives before this runs, it takes priority.
+  let queryAuthTimer = null
+  if (queryToken) {
+    queryAuthTimer = setTimeout(() => {
+      if (client.authenticated) return // message token already handled it
+      const decoded = authenticateClient(queryToken, ip)
+      if (!decoded) {
+        ws.close(1008, 'Invalid token')
+        return
+      }
+      registerClient(client, ws, decoded, ip, 'query token fallback')
+    }, 100) // 100ms window — message token from client onopen arrives over network; this runs after
+  }
+
   // Handle heartbeat
   ws.on('pong', () => {
     client.isAlive = true
@@ -120,12 +159,18 @@ wss.on('connection', (ws, req) => {
     try {
       const message = JSON.parse(data)
 
-      // Handle authenticate message (primary auth method — token sent after connection)
+      // Handle authenticate message — PRIMARY auth method (takes priority over query token)
       if (message.type === 'authenticate' && message.token) {
         if (client.authenticated) {
           // Already authenticated
           ws.send(JSON.stringify({ type: 'authenticated', clientId: client.userId }))
           return
+        }
+
+        // Cancel the query token fallback timer since message auth takes priority
+        if (queryAuthTimer) {
+          clearTimeout(queryAuthTimer)
+          queryAuthTimer = null
         }
 
         const decoded = authenticateClient(message.token, ip)
@@ -134,20 +179,7 @@ wss.on('connection', (ws, req) => {
           return
         }
 
-        // Register authenticated client
-        const clientId = decoded.id || decoded.sub || 'unknown'
-        client.userId = clientId
-        client.tenantId = decoded.tenantId
-        client.mode = decoded.mode || 'tenant'
-        client.authenticated = true
-
-        clients.set(ws, client)
-        connectionsByIp.set(ip, (connectionsByIp.get(ip) || 0) + 1)
-        if (decoded.tenantId) {
-          connectionsByTenant.set(decoded.tenantId, (connectionsByTenant.get(decoded.tenantId) || 0) + 1)
-        }
-
-        console.log(`✅ Client authenticated (message token): ${clientId} (${decoded.tenantId || 'account'} mode)`)
+        registerClient(client, ws, decoded, ip, 'message token')
         ws.send(JSON.stringify({ type: 'authenticated', clientId: client.userId }))
         return
       }
@@ -176,6 +208,7 @@ wss.on('connection', (ws, req) => {
 
   // Handle close
   ws.on('close', () => {
+    if (queryAuthTimer) clearTimeout(queryAuthTimer)
     clients.delete(ws)
     connectionsByIp.set(ip, Math.max(0, (connectionsByIp.get(ip) || 1) - 1))
     if (client.tenantId) {
