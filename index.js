@@ -66,6 +66,7 @@ const wss = new WebSocketServer({
 
 /**
  * Authenticate client using JWT token
+ * Returns decoded payload on success, or { error: string } on failure
  */
 function authenticateClient(token, ip) {
   try {
@@ -75,7 +76,7 @@ function authenticateClient(token, ip) {
     const ipCount = connectionsByIp.get(ip) || 0
     if (ipCount >= MAX_CONNECTIONS_PER_IP) {
       console.warn(`⚠️  IP limit reached: ${ip}`)
-      return null
+      return { error: 'IP_LIMIT' }
     }
 
     // Check tenant limit
@@ -83,14 +84,18 @@ function authenticateClient(token, ip) {
       const tenantCount = connectionsByTenant.get(decoded.tenantId) || 0
       if (tenantCount >= MAX_CONNECTIONS_PER_TENANT) {
         console.warn(`⚠️  Tenant limit reached: ${decoded.tenantId}`)
-        return null
+        return { error: 'TENANT_LIMIT' }
       }
     }
 
     return decoded
   } catch (error) {
+    if (error.name === 'TokenExpiredError') {
+      console.warn(`⚠️  Token expired for IP ${ip}`)
+      return { error: 'TOKEN_EXPIRED' }
+    }
     console.error(`❌ Auth failed: ${error.message}`)
-    return null
+    return { error: 'INVALID_TOKEN' }
   }
 }
 
@@ -113,12 +118,27 @@ function registerClient(client, ws, decoded, ip, source) {
 }
 
 /**
+ * Handle auth result — send error or close as appropriate
+ */
+function handleAuthFailure(ws, result) {
+  if (result.error === 'TOKEN_EXPIRED') {
+    ws.send(JSON.stringify({ type: 'error', code: 'TOKEN_EXPIRED', message: 'Token expired, please refresh and reconnect' }))
+    ws.close(1008, 'Token expired')
+  } else if (result.error === 'IP_LIMIT' || result.error === 'TENANT_LIMIT') {
+    ws.send(JSON.stringify({ type: 'error', code: result.error, message: 'Connection limit reached' }))
+    ws.close(1008, 'Connection limit reached')
+  } else {
+    ws.close(1008, 'Invalid token')
+  }
+}
+
+/**
  * Handle new WebSocket connection
  */
 wss.on('connection', (ws, req) => {
   const ip = req.socket.remoteAddress || 'unknown'
 
-  // Query token — lower priority, used only if no message-based auth arrives
+  // Query token — lower priority fallback if no message-based auth arrives
   const url = new URL(req.url, `http://${req.headers.host}`)
   const queryToken = url.searchParams.get('token')
 
@@ -133,20 +153,19 @@ wss.on('connection', (ws, req) => {
     authenticated: false
   }
 
-  // Schedule query token as fallback — fires after a short delay
-  // allowing the client to send an authenticate message first.
-  // If a message token arrives before this runs, it takes priority.
+  // Schedule query token as fallback — fires after 100ms,
+  // allowing the client's onopen authenticate message to arrive first (takes priority).
   let queryAuthTimer = null
   if (queryToken) {
     queryAuthTimer = setTimeout(() => {
       if (client.authenticated) return // message token already handled it
-      const decoded = authenticateClient(queryToken, ip)
-      if (!decoded) {
-        ws.close(1008, 'Invalid token')
+      const result = authenticateClient(queryToken, ip)
+      if (result.error) {
+        handleAuthFailure(ws, result)
         return
       }
-      registerClient(client, ws, decoded, ip, 'query token fallback')
-    }, 100) // 100ms window — message token from client onopen arrives over network; this runs after
+      registerClient(client, ws, result, ip, 'query token fallback')
+    }, 100)
   }
 
   // Handle heartbeat
@@ -162,24 +181,23 @@ wss.on('connection', (ws, req) => {
       // Handle authenticate message — PRIMARY auth method (takes priority over query token)
       if (message.type === 'authenticate' && message.token) {
         if (client.authenticated) {
-          // Already authenticated
           ws.send(JSON.stringify({ type: 'authenticated', clientId: client.userId }))
           return
         }
 
-        // Cancel the query token fallback timer since message auth takes priority
+        // Cancel the query token fallback — message auth takes priority
         if (queryAuthTimer) {
           clearTimeout(queryAuthTimer)
           queryAuthTimer = null
         }
 
-        const decoded = authenticateClient(message.token, ip)
-        if (!decoded) {
-          ws.close(1008, 'Invalid token')
+        const result = authenticateClient(message.token, ip)
+        if (result.error) {
+          handleAuthFailure(ws, result)
           return
         }
 
-        registerClient(client, ws, decoded, ip, 'message token')
+        registerClient(client, ws, result, ip, 'message token')
         ws.send(JSON.stringify({ type: 'authenticated', clientId: client.userId }))
         return
       }
